@@ -37,6 +37,7 @@
 #include <math.h>
 #include <thread>
 #include <fstream>
+#include <filesystem>
 #include <csignal>
 #include <chrono>
 #include <unistd.h>
@@ -85,8 +86,9 @@ mutex mtx_buffer;
 condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
-string map_file_path, lid_topic, imu_topic;
+string map_file_path, lid_topic, imu_topic, pcd_path;
 
+double leaf_size = 0.1;
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
@@ -486,6 +488,8 @@ void map_incremental()
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI());
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
+
+// 发布 当前扫描点云（一帧 lidar 数据）
 void publish_frame_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull)
 {
     if(scan_pub_en)
@@ -562,6 +566,7 @@ void publish_frame_body(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shared
     publish_count -= PUBFRAME_PERIOD;
 }
 
+// 发布特征点（Edge / Plane / Ground 等）
 void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect)
 {
     PointCloudXYZI::Ptr laserCloudWorld( \
@@ -578,6 +583,7 @@ void publish_effect_world(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::Shar
     pubLaserCloudEffect->publish(laserCloudFullRes3);
 }
 
+// 发布累积地图/局部地图
 void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudMap)
 {
     PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
@@ -793,6 +799,50 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     solve_time += omp_get_wtime() - solve_start_;
 }
 
+
+
+// 定位相关代码
+using PointType = pcl::PointXYZINormal;
+using CloudType = pcl::PointCloud<PointType>;
+CloudType::Ptr downsampleCloud(new CloudType);
+
+bool loadMap(const std::string &path, double leaf_size)
+{
+    if (!std::filesystem::exists(path))
+    {
+        std::cerr << "Map file not found: " << path << std::endl;
+        return false;
+    }
+    pcl::VoxelGrid<PointType> m_voxel_filter;
+    pcl::PCDReader reader;
+    CloudType::Ptr cloud(new CloudType);
+    reader.read(path, *cloud);
+
+    m_voxel_filter.setLeafSize(leaf_size, leaf_size, leaf_size);
+    m_voxel_filter.setInputCloud(cloud);
+    m_voxel_filter.filter(*downsampleCloud);
+
+    return true;
+}
+
+// 发布全局地图点云
+void publishMapCloud(builtin_interfaces::msg::Time &time,rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_map_cloud_pub)
+{
+    if (downsampleCloud->size() < 1)
+    {
+        cout<<"Map cloud is empty, skip publishing."<<endl;
+        return;
+    }
+    
+    sensor_msgs::msg::PointCloud2 map_cloud_msg;
+    pcl::toROSMsg(*downsampleCloud, map_cloud_msg);
+    map_cloud_msg.header.frame_id = "camera_init";
+    map_cloud_msg.header.stamp = time;
+    m_map_cloud_pub->publish(map_cloud_msg);
+}
+
+
+
 class LaserMappingNode : public rclcpp::Node
 {
 public:
@@ -829,6 +879,8 @@ public:
         this->declare_parameter<bool>("feature_extract_enable", false);
         this->declare_parameter<bool>("runtime_pos_log_enable", false);
         this->declare_parameter<bool>("mapping.extrinsic_est_en", true);
+        this->declare_parameter<string>("localization.pcd_path", "");
+        this->declare_parameter<double>("localization.leaf_size", 0.1);
         this->declare_parameter<bool>("pcd_save.pcd_save_en", false);
         this->declare_parameter<int>("pcd_save.interval", -1);
         this->declare_parameter<vector<double>>("mapping.extrinsic_T", vector<double>());
@@ -865,6 +917,8 @@ public:
         this->get_parameter_or<bool>("feature_extract_enable", p_pre->feature_enabled, false);
         this->get_parameter_or<bool>("runtime_pos_log_enable", runtime_pos_log, 0);
         this->get_parameter_or<bool>("mapping.extrinsic_est_en", extrinsic_est_en, true);
+        this->get_parameter_or<string>("localization.pcd_path", pcd_path, "");
+        this->get_parameter_or<double>("localization.leaf_size", leaf_size, 0.1);
         this->get_parameter_or<bool>("pcd_save.pcd_save_en", pcd_save_en, false);
         this->get_parameter_or<int>("pcd_save.interval", pcd_save_interval, -1);
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
@@ -944,7 +998,26 @@ public:
 
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
 
-        RCLCPP_INFO(this->get_logger(), "Node init finished.");
+        /*----------------------加载点云用于debug定位----------------------*/
+        m_map_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("map_cloud", 10);
+        if (!pcd_path.empty())
+        {
+            bool load_flag = loadMap(pcd_path, leaf_size);
+            if (!load_flag)
+            {
+                RCLCPP_FATAL(this->get_logger(), "Failed to load global map from PCD file!");
+                rclcpp::shutdown();
+                return;
+            }
+            RCLCPP_INFO(this->get_logger(), "Global map initialized from PCD: %s", pcd_path.c_str());
+            sleep(2); // 防止rviz还没启动起来，接受不到点云
+            builtin_interfaces::msg::Time current_time = rclcpp::Clock().now();
+            publishMapCloud(current_time,m_map_cloud_pub);
+            RCLCPP_INFO(this->get_logger(), "Node init finished.");
+            return;
+        }
+        RCLCPP_FATAL(this->get_logger(), "No PCD file path provided! Set parameter 'pcd_path'.");
+        rclcpp::shutdown();
     }
 
     ~LaserMappingNode()
@@ -1129,6 +1202,7 @@ private:
     }
 
 private:
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_map_cloud_pub;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudFull_body_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pubLaserCloudEffect_;
