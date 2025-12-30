@@ -86,9 +86,8 @@ mutex mtx_buffer;
 condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
-string map_file_path, lid_topic, imu_topic, pcd_path;
+string map_file_path, lid_topic, imu_topic;
 
-double leaf_size = 0.1;
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
 double gyr_cov = 0.1, acc_cov = 0.1, b_gyr_cov = 0.0001, b_acc_cov = 0.0001;
@@ -801,7 +800,10 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
 
 
-// 定位相关代码
+/*----------------------------定位相关代码----------------------------*/
+
+double leaf_size = 0.1;
+string pcd_path;
 using PointType = pcl::PointXYZINormal;
 using CloudType = pcl::PointCloud<PointType>;
 CloudType::Ptr downsampleCloud(new CloudType);
@@ -841,7 +843,7 @@ void publishMapCloud(builtin_interfaces::msg::Time &time,rclcpp::Publisher<senso
     m_map_cloud_pub->publish(map_cloud_msg);
 }
 
-
+/*----------------------------定位相关代码----------------------------*/
 
 class LaserMappingNode : public rclcpp::Node
 {
@@ -999,25 +1001,26 @@ public:
         map_save_srv_ = this->create_service<std_srvs::srv::Trigger>("map_save", std::bind(&LaserMappingNode::map_save_callback, this, std::placeholders::_1, std::placeholders::_2));
 
         /*----------------------加载点云用于debug定位----------------------*/
-        m_map_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("map_cloud", 10);
-        if (!pcd_path.empty())
-        {
-            bool load_flag = loadMap(pcd_path, leaf_size);
-            if (!load_flag)
-            {
-                RCLCPP_FATAL(this->get_logger(), "Failed to load global map from PCD file!");
-                rclcpp::shutdown();
-                return;
-            }
-            RCLCPP_INFO(this->get_logger(), "Global map initialized from PCD: %s", pcd_path.c_str());
-            sleep(2); // 防止rviz还没启动起来，接受不到点云
-            builtin_interfaces::msg::Time current_time = rclcpp::Clock().now();
-            publishMapCloud(current_time,m_map_cloud_pub);
-            RCLCPP_INFO(this->get_logger(), "Node init finished.");
-            return;
-        }
-        RCLCPP_FATAL(this->get_logger(), "No PCD file path provided! Set parameter 'pcd_path'.");
-        rclcpp::shutdown();
+        // m_map_cloud_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("map_cloud", 10);
+        // if (!pcd_path.empty())
+        // {
+        //     bool load_flag = loadMap(pcd_path, leaf_size);
+        //     if (!load_flag)
+        //     {
+        //         RCLCPP_FATAL(this->get_logger(), "Failed to load global map from PCD file!");
+        //         rclcpp::shutdown();
+        //         return;
+        //     }
+        //     RCLCPP_INFO(this->get_logger(), "Global map initialized from PCD: %s", pcd_path.c_str());
+        //     sleep(2); // 防止rviz还没启动起来，接受不到点云
+        //     builtin_interfaces::msg::Time current_time = rclcpp::Clock().now();
+        //     publishMapCloud(current_time,m_map_cloud_pub);
+        //     RCLCPP_INFO(this->get_logger(), "Node init finished.");
+        //     return;
+        // }
+        // RCLCPP_FATAL(this->get_logger(), "No PCD file path provided! Set parameter 'pcd_path'.");
+        // rclcpp::shutdown();
+        RCLCPP_INFO(this->get_logger(), "Node init finished.");
     }
 
     ~LaserMappingNode()
